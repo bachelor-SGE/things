@@ -1,0 +1,102 @@
+import io
+import os
+import sys
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageFilter
+
+def compress_image(
+    input_path: str,
+    output_path: str,
+    max_size_mb: float = 9.0,
+    init_quality: int = 95,
+    quality_step: int = 5,
+    max_blur_radius: float = 2.0
+):
+    """
+    Сжимает изображение путём итеративного понижения JPEG-качества и добавления лёгкого размытия,
+    чтобы итоговый файл не превышал max_size_mb мегабайт.
+    """
+    max_bytes = max_size_mb * 1024 * 1024
+
+    try:
+        img = Image.open(input_path)
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
+        return False
+
+    quality = init_quality
+    blur_radius = 0.0
+
+    while True:
+        proc_img = img.copy()
+        if blur_radius > 0:
+            proc_img = proc_img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+        buf = io.BytesIO()
+        proc_img.save(buf, format='JPEG', quality=quality)
+        size = buf.tell()
+
+        if size <= max_bytes:
+            try:
+                with open(output_path, 'wb') as f:
+                    f.write(buf.getvalue())
+                return True, quality, blur_radius, size
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
+                return False
+
+        if quality - quality_step >= 10:
+            quality -= quality_step
+        else:
+            if blur_radius < max_blur_radius:
+                blur_radius += 0.5
+                quality = init_quality
+            else:
+                w, h = img.size
+                img = img.resize((int(w * 0.9), int(h * 0.9)), Image.LANCZOS)
+                quality = init_quality
+                blur_radius = 0.0
+
+
+def main():
+    root = tk.Tk()
+    root.withdraw()  # Скрыть главное окно
+
+    # Выбор нескольких входных файлов
+    input_paths = filedialog.askopenfilenames(
+        title="Выберите изображения для сжатия",
+        filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff *.gif"), ("All files", "*")]
+    )
+    if not input_paths:
+        messagebox.showwarning("Отменено", "Файлы не выбраны.")
+        sys.exit(0)
+
+    # Выбор папки для сохранения
+    output_dir = filedialog.askdirectory(
+        title="Выберите папку для сохранения"
+    )
+    if not output_dir:
+        messagebox.showwarning("Отменено", "Папка для сохранения не выбрана.")
+        sys.exit(0)
+
+    results = []
+    for input_path in input_paths:
+        base = os.path.basename(input_path)
+        name, _ = os.path.splitext(base)
+        output_path = os.path.join(output_dir, f"{name}_compressed.jpg")
+        res = compress_image(input_path, output_path)
+        if res and isinstance(res, tuple):
+            ok, quality, blur_radius, size = res
+            if ok:
+                results.append(f"{name}: качество={quality}, размытие={blur_radius:.1f}, размер={size/1024/1024:.2f}МБ")
+        else:
+            results.append(f"{name}: ошибка при обработке")
+
+    # Показать сводный результат
+    summary = "\n".join(results)
+    messagebox.showinfo("Готово", f"Обработка завершена:\n{summary}")
+
+
+if __name__ == "__main__":
+    main()
