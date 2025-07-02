@@ -1,0 +1,385 @@
+import os
+import threading
+import tkinter as tk
+from tkinter import messagebox
+import pyautogui
+import cv2
+import numpy as np
+import pytesseract
+import gym
+from gym import spaces
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+import time
+
+# Если Tesseract не находится в PATH, укажите его путь:
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+############################################################
+# Глобальные переменные для управления обучением
+############################################################
+PAUSE_TRAINING = False
+STOP_TRAINING = False
+
+############################################################
+# Callback для паузы и остановки обучения (Stable-Baselines3)
+############################################################
+class PauseCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super(PauseCallback, self).__init__(verbose)
+    def _on_step(self) -> bool:
+        global PAUSE_TRAINING, STOP_TRAINING
+        if STOP_TRAINING:
+            return False  # остановить обучение
+        while PAUSE_TRAINING:
+            time.sleep(0.1)
+            if STOP_TRAINING:
+                return False
+        return True
+
+############################################################
+# Callback для логирования награды после каждого rollout
+############################################################
+class RewardLoggingCallback(BaseCallback):
+    def _on_step(self) -> bool:
+        # Пустая реализация для удовлетворения абстрактного метода.
+        return True
+    def _on_rollout_end(self) -> bool:
+        rewards = self.model.rollout_buffer.rewards
+        avg_reward = np.mean(rewards)
+        print(f"Rollout average reward: {avg_reward:.2f}")
+        return True
+
+############################################################
+# Callback для логирования награды в реальном времени
+############################################################
+class RealTimeRewardCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super(RealTimeRewardCallback, self).__init__(verbose)
+        self.last_reward = None
+    def _on_step(self) -> bool:
+        rewards = self.locals.get("rewards")
+        if rewards is not None:
+            current_reward = rewards[0]  # предполагается одна среда
+            if self.last_reward is None or current_reward != self.last_reward:
+                print(f"Real-time reward: {current_reward:.2f}")
+                self.last_reward = current_reward
+        return True
+
+############################################################
+# Вспомогательные функции
+############################################################
+def click_region(region):
+    """Кликаем в центре указанной области.
+    region: (x, y, width, height)"""
+    if not region:
+        return
+    x, y, w, h = region
+    center_x = x + w // 2
+    center_y = y + h // 2
+    pyautogui.moveTo(center_x, center_y, duration=0.2)
+    pyautogui.click()
+
+def get_screenshot(region):
+    """Делает скриншот указанной области и возвращает изображение в формате BGR.
+    region: (x, y, width, height)"""
+    if not region:
+        return None
+    x, y, w, h = region
+    screenshot = pyautogui.screenshot(region=(x, y, w, h))
+    img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+    return img
+
+def get_score_from_region(region):
+    """Считывает текст из области (например, 'Счет') через OCR и пытается преобразовать его в float."""
+    img = get_screenshot(region)
+    if img is None:
+        return 0
+    text = pytesseract.image_to_string(img, lang='rus+eng').strip()
+    try:
+        value = float(text.replace(',', '.').replace('+', ''))
+        if '-' in text:
+            value = -abs(value)
+        return value
+    except ValueError:
+        return 0
+
+############################################################
+# Класс для полноэкранного выбора области (ScreenSelector)
+############################################################
+class ScreenSelector(tk.Toplevel):
+    """
+    Открывает полноэкранное окно для выбора области.
+    Пользователь выделяет прямоугольник, затем вызывается callback с координатами (x, y, width, height).
+    """
+    def __init__(self, callback, **kwargs):
+        super().__init__(**kwargs)
+        self.callback = callback
+        self.start_x = None
+        self.start_y = None
+        self.rect = None
+        self.overrideredirect(True)
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        self.geometry(f"{sw}x{sh}+0+0")
+        try:
+            self.attributes("-alpha", 0.3)
+        except Exception:
+            pass
+        self.config(bg="black")
+        self.canvas = tk.Canvas(self, cursor="cross", bg="black")
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<ButtonPress-1>", self.on_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
+    def on_button_press(self, event):
+        self.start_x = event.x
+        self.start_y = event.y
+        self.rect = self.canvas.create_rectangle(
+            self.start_x, self.start_y, self.start_x, self.start_y,
+            outline="red", width=2
+        )
+    def on_mouse_drag(self, event):
+        self.canvas.coords(self.rect, self.start_x, self.start_y, event.x, event.y)
+    def on_button_release(self, event):
+        end_x, end_y = event.x, event.y
+        x = min(self.start_x, end_x)
+        y = min(self.start_y, end_y)
+        w = abs(end_x - self.start_x)
+        h = abs(end_y - self.start_y)
+        if w < 10 or h < 10:
+            messagebox.showerror("Ошибка", "Область выбрана некорректно!")
+        else:
+            self.callback(x, y, w, h)
+        self.destroy()
+
+############################################################
+# Класс GUI для настройки зон и управления обучением
+############################################################
+class RegionSelectorGUI:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Настройка зон и управление обучением")
+        self.master.geometry("350x600")
+
+        # Переменные для хранения координат областей
+        self.buy_region = None
+        self.sell_region = None
+        self.next_region = None
+        self.score_region = None
+        self.main_region = None  # Область, которую видит ИИ
+        self.close_region = None  # Область для "Закрыть сделку"
+
+        # Кнопки для выделения зон
+        tk.Button(master, text="Выбрать 'Покупка'", command=lambda: self.select_region("buy")).pack(pady=5)
+        tk.Button(master, text="Выбрать 'Продажа'", command=lambda: self.select_region("sell")).pack(pady=5)
+        tk.Button(master, text="Выбрать 'Следующий день'", command=lambda: self.select_region("next")).pack(pady=5)
+        tk.Button(master, text="Выбрать 'Счет'", command=lambda: self.select_region("score")).pack(pady=5)
+        tk.Button(master, text="Выбрать 'Главный экран'", command=lambda: self.select_region("main")).pack(pady=5)
+        tk.Button(master, text="Выбрать 'Закрыть сделку'", command=lambda: self.select_region("close")).pack(pady=5)
+
+        # Кнопки управления обучением
+        tk.Button(master, text="Старт обучения", command=self.start_training).pack(pady=5)
+        tk.Button(master, text="Пауза обучения (F1)", command=self.toggle_pause).pack(pady=5)
+        tk.Button(master, text="Остановить обучение", command=self.stop_training).pack(pady=5)
+
+        self.status_label = tk.Label(master, text="Статус: ожидание")
+        self.status_label.pack(pady=10)
+        self.reward_label = tk.Label(master, text="Последняя награда: N/A")
+        self.reward_label.pack(pady=10)
+        self.score_value_label = tk.Label(master, text="OCR (Счет): N/A")
+        self.score_value_label.pack(pady=10)
+
+        # Привязка клавиши F1 для переключения паузы
+        master.bind("<F1>", self.toggle_pause)
+        self.update_score_display()
+
+    def update_score_display(self):
+        if self.score_region is not None:
+            score_val = get_score_from_region(self.score_region)
+            self.score_value_label.config(text=f"OCR (Счет): {score_val:.2f}")
+        else:
+            self.score_value_label.config(text="OCR (Счет): N/A")
+        self.master.after(1000, self.update_score_display)
+
+    def select_region(self, region_type):
+        selector = ScreenSelector(lambda x, y, w, h: self.set_region_callback(region_type, x, y, w, h))
+        self.master.wait_window(selector)
+
+    def set_region_callback(self, region_type, x, y, w, h):
+        if region_type == "buy":
+            self.buy_region = (x, y, w, h)
+            print("Регион для покупки:", self.buy_region)
+        elif region_type == "sell":
+            self.sell_region = (x, y, w, h)
+            print("Регион для продажи:", self.sell_region)
+        elif region_type == "next":
+            self.next_region = (x, y, w, h)
+            print("Регион для 'Следующий день':", self.next_region)
+        elif region_type == "score":
+            self.score_region = (x, y, w, h)
+            print("Регион для 'Счет':", self.score_region)
+        elif region_type == "main":
+            self.main_region = (x, y, w, h)
+            print("Регион для 'Главный экран':", self.main_region)
+        elif region_type == "close":
+            self.close_region = (x, y, w, h)
+            print("Регион для 'Закрыть сделку':", self.close_region)
+        self.status_label.config(text=f"{region_type} выбрана")
+
+    def start_training(self):
+        # Проверяем, что все необходимые зоны выбраны
+        required = (self.buy_region, self.sell_region, self.next_region, self.score_region, self.main_region, self.close_region)
+        if any(r is None for r in required):
+            messagebox.showerror("Ошибка", "Не все зоны выбраны!")
+            return
+        global STOP_TRAINING
+        STOP_TRAINING = False
+        self.status_label.config(text="Обучение запущено")
+        print("Запуск обучения с зонами:")
+        print("Покупка:", self.buy_region)
+        print("Продажа:", self.sell_region)
+        print("Следующий день:", self.next_region)
+        print("Счет:", self.score_region)
+        print("Главный экран:", self.main_region)
+        print("Закрыть сделку:", self.close_region)
+        training_thread = threading.Thread(target=self.run_training, daemon=True)
+        training_thread.start()
+
+    def run_training(self):
+        # Создаем среду, где наблюдение берется из области 'Главный экран'
+        env = TradingEnv(self.buy_region, self.sell_region, self.next_region, self.score_region, self.main_region, self.close_region)
+        model = train_agent(env, total_timesteps=10000)
+        test_agent(env, model, steps=10, reward_callback=lambda r: self.master.after(0, lambda: self.reward_label.config(text=f"Последняя награда: {r:.2f}")))
+        self.status_label.config(text="Обучение завершено")
+        print("Обучение завершено")
+
+    def toggle_pause(self, event=None):
+        global PAUSE_TRAINING
+        PAUSE_TRAINING = not PAUSE_TRAINING
+        if PAUSE_TRAINING:
+            self.status_label.config(text="Обучение приостановлено")
+            print("Обучение приостановлено")
+        else:
+            self.status_label.config(text="Обучение возобновлено")
+            print("Обучение возобновлено")
+
+    def stop_training(self):
+        global STOP_TRAINING
+        STOP_TRAINING = True
+        self.status_label.config(text="Обучение остановлено")
+        print("Обучение остановлено")
+
+############################################################
+# Среда RL (TradingEnv) – наблюдение из главного экрана, награда из "Счет"
+############################################################
+class TradingEnv(gym.Env):
+    def __init__(self, buy_region, sell_region, next_region, score_region, main_region, close_region):
+        super(TradingEnv, self).__init__()
+        self.buy_region = buy_region
+        self.sell_region = sell_region
+        self.next_region = next_region
+        self.score_region = score_region
+        self.main_region = main_region  # Область для наблюдения
+        self.close_region = close_region  # Область для закрытия сделки
+
+        # Действия: 0 - Покупка, 1 - Продажа, 2 - Следующий день, 3 - Закрыть сделку
+        self.action_space = spaces.Discrete(4)
+        # Наблюдение – OCR значение из области 'Главный экран'
+        self.observation_space = spaces.Box(low=-1e6, high=1e6, shape=(1,), dtype=np.float32)
+
+        self.prev_score = get_score_from_region(self.score_region)
+
+    def reset(self):
+        self.prev_score = get_score_from_region(self.score_region)
+        obs_val = self.get_main_screen_value()
+        return np.array([obs_val], dtype=np.float32)
+
+    def step(self, action):
+        if action == 0:
+            click_region(self.buy_region)
+        elif action == 1:
+            click_region(self.sell_region)
+        elif action == 2:
+            click_region(self.next_region)
+        elif action == 3:
+            click_region(self.close_region)
+        time.sleep(1.0)
+        current_score = get_score_from_region(self.score_region)
+        reward = current_score - self.prev_score
+        self.prev_score = current_score
+        obs_val = self.get_main_screen_value()
+        obs = np.array([obs_val], dtype=np.float32)
+        done = False
+        info = {}
+        return obs, reward, done, info
+
+    def get_main_screen_value(self):
+        """Возвращает OCR значение из области 'Главный экран' как число."""
+        img = get_screenshot(self.main_region)
+        if img is None:
+            return 0.0
+        text = pytesseract.image_to_string(img, lang='rus+eng').strip()
+        try:
+            value = float(text.replace(',', '.').replace('+', ''))
+            if '-' in text:
+                value = -abs(value)
+            return value
+        except ValueError:
+            return 0.0
+
+############################################################
+# Функции обучения и тестирования агента
+############################################################
+def train_agent(env, total_timesteps=10000):
+    model_path = "ppo_trading_env_model"
+    if os.path.exists(model_path + ".zip"):
+        model = PPO.load(model_path, env=env)
+        print("Модель загружена с диска.")
+    else:
+        model = PPO("MlpPolicy", env, verbose=1)
+        print("Создана новая модель.")
+    pause_callback = PauseCallback()
+    reward_logger = RewardLoggingCallback()
+    real_time_logger = RealTimeRewardCallback()
+    callbacks = CallbackList([pause_callback, reward_logger, real_time_logger])
+    model.learn(total_timesteps=total_timesteps, callback=callbacks)
+    model.save(model_path)
+    print("Модель сохранена на диск.")
+    return model
+
+def test_agent(env, model, steps=10, reward_callback=None):
+    obs = env.reset()
+    for i in range(steps):
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, done, info = env.step(action)
+        print(f"Step {i}: Action={action}, Reward={reward}, Info={info}")
+        if reward_callback is not None:
+            reward_callback(reward)
+        if done:
+            obs = env.reset()
+
+############################################################
+# Функция для всплывающего окна с OCR из области "Счет"
+############################################################
+def show_ocr_info(master, region):
+    img = get_screenshot(region)
+    if img is None:
+        text_ = "Невозможно сделать скриншот."
+    else:
+        text_ = pytesseract.image_to_string(img, lang='rus+eng').strip()
+    top = tk.Toplevel(master)
+    top.title("OCR (Счет)")
+    tk.Label(top, text=f"OCR (Счет):\n{text_}", padx=10, pady=10).pack()
+    tk.Button(top, text="Закрыть", command=top.destroy).pack(pady=5)
+
+############################################################
+# Главная функция
+############################################################
+def main():
+    root = tk.Tk()
+    app = RegionSelectorGUI(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
